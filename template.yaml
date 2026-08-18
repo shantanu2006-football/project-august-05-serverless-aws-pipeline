@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless data pipeline: S3 upload triggers an ingest Lambda that
+  extracts metadata and transforms CSV files, which publishes a
+  FileProcessed event on EventBridge consumed by a catalog Lambda that
+  writes the result to DynamoDB.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment name, used to namespace resources.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: INFO
+
+Resources:
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "data-pipeline-source-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "data-pipeline-output-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DataPipelineEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "data-pipeline-bus-${Environment}"
+
+  FileCatalogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "FileCatalog-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: file_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: file_key
+          KeyType: HASH
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "data-pipeline-ingest-${Environment}"
+      CodeUri: src/
+      Handler: pipeline.ingest.handler.lambda_handler
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputBucket
+          EVENT_BUS_NAME: !Ref DataPipelineEventBus
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - S3CrudPolicy:
+            BucketName: !Ref OutputBucket
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref DataPipelineEventBus
+      Events:
+        FileUploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref SourceBucket
+            Events: s3:ObjectCreated:*
+
+  CatalogFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "data-pipeline-catalog-${Environment}"
+      CodeUri: src/
+      Handler: pipeline.catalog.handler.lambda_handler
+      Environment:
+        Variables:
+          CATALOG_TABLE_NAME: !Ref FileCatalogTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FileCatalogTable
+      Events:
+        FileProcessed:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref DataPipelineEventBus
+            Pattern:
+              source:
+                - data.pipeline.ingest
+              detail-type:
+                - FileProcessed
+
+Outputs:
+  SourceBucketName:
+    Description: Upload data files here to trigger the pipeline.
+    Value: !Ref SourceBucket
+  OutputBucketName:
+    Description: Transformed JSONL output is written here.
+    Value: !Ref OutputBucket
+  EventBusName:
+    Description: Custom EventBridge bus carrying FileProcessed events.
+    Value: !Ref DataPipelineEventBus
+  FileCatalogTableName:
+    Description: DynamoDB table holding one catalog record per processed file.
+    Value: !Ref FileCatalogTable
